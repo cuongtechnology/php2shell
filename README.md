@@ -135,6 +135,9 @@ python3 poc.py http://target.example.com/index.php "id"
 # Specify LFI parameter
 python3 poc.py http://target.example.com/ "id" --lfi-param page
 
+# Scan/exploit targets from a file (one URL per line)
+python3 poc.py --targets-file targets.txt "id"
+
 # Interactive shell
 python3 poc.py http://target.example.com/ "id" -i
 
@@ -167,8 +170,31 @@ optional:
   --probe-only           Only check if target is vulnerable, don't exploit
   --no-verify            Skip SSL certificate verification
   --cafile FILE          CA certificate file for SSL verification
-  -i, --interactive      Drop to interactive shell on success
+  --proxy URL             Route HTTP(S) and raw uploads through an HTTP(S) or SOCKS proxy
+  --targets-file FILE    Read one target URL per line; blank lines and # comments are ignored
+  -i, --interactive       Drop to interactive shell on success
   --callback URL         Blind callback URL (exfiltrate output via HTTP)
+```
+
+Proxy examples:
+
+```bash
+python3 poc.py http://target.example.com/index.php id --proxy http://127.0.0.1:8080
+python3 poc.py https://target.example.com/index.php id --proxy socks5h://127.0.0.1:9050
+```
+
+`targets.txt` format:
+
+```text
+# comments and blank lines are ignored
+http://target-one.example.com/index.php
+https://target-two.example.com/app.php?page=home
+```
+
+SOCKS proxy support requires the optional PySocks package:
+
+```bash
+pip install PySocks
 ```
 
 ### Lab (Apache + LFI)
@@ -226,4 +252,3 @@ Licensed under the [MIT License](LICENSE).
 
 ## GitAds Sponsored
 [![Sponsored by GitAds](https://gitads.dev/v1/ad-serve?source=syrex1013/php2shell@github)](https://gitads.dev/v1/ad-track?source=syrex1013/php2shell@github)
-
